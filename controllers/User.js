@@ -92,7 +92,7 @@ exports.login = (req, res) => {
 
 exports.addUser = async (req, res) => {
 
-    let pass = bcrypt.hash("2580", 10);
+    let pass = await bcrypt.hash("2580", 10);
 
     const newUser = new User({
 
