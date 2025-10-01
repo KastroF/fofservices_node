@@ -26,6 +26,7 @@ const userSchema = mongoose.Schema({
     locked: {type: String}, 
     time: {type: Number}, 
     amount: {type: Number}, 
+    minAmount: {type: Number}, 
     amBalance: {type: Number},
     mmBalance: {type: Number},
     flashBalance: {type: Number},
