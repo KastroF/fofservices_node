@@ -473,13 +473,13 @@ exports.launchOrder = async (req, res) => {
       });
     }
 
-    if((currentServicee && (currentServicee === "Airtel Money" || currentServicee === "Moov Money")) && parseInt(amount) < 50000){
+    if((currentServicee && (currentServicee === "Airtel Money" || currentServicee === "Moov Money")) && parseInt(amount) < user.minAmount){
 
-      console.log("TU ne peux pas prendre moins de 50");
+     // console.log("TU ne peux pas prendre moins de 50");
 
       return res.status(200).json({
         status: 1,
-        message: "Vous ne pouvez pas commander moins de 50000 FCFA"
+        message: `Vous ne pouvez pas commander moins de ${user.minAmount} FCFA`
       });
 
 
