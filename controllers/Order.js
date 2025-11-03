@@ -473,16 +473,14 @@ exports.launchOrder = async (req, res) => {
       });
     }
 
-    if((currentServicee && (currentServicee === "Airtel Money" || currentServicee === "Moov Money")) && parseInt(amount) < user.minAmount){
-
-     // console.log("TU ne peux pas prendre moins de 50");
-
+    if (
+      (currentServicee && (currentServicee === "Airtel Money" || currentServicee === "Moov Money")) &&
+      parseInt(amount) < user.minAmount
+    ) {
       return res.status(200).json({
         status: 1,
         message: `Vous ne pouvez pas commander moins de ${user.minAmount} FCFA`
       });
-
-
     }
 
     const serviceBalances = {
@@ -535,8 +533,6 @@ exports.launchOrder = async (req, res) => {
       });
     }
 
-
-
     const serviceMap = {
       "Flash Airtel": { phone: user.flashPhone, type: "flash" },
       "Express": { phone: user.expressPhone, type: "express" },
@@ -549,6 +545,18 @@ exports.launchOrder = async (req, res) => {
       return res.status(400).json({ status: 1, message: "Service non reconnu" });
     }
 
+    // 🧹 NOUVELLE CONDITION : supprimer l’ancienne commande "initial" du même type
+    const deleted = await Order.deleteMany({
+      agent_id: req.auth.userId,
+      type: service.type,
+      status: "initial"
+    });
+
+    if (deleted.deletedCount > 0) {
+      console.log(`🧹 ${deleted.deletedCount} commande(s) initial supprimée(s) pour ${service.type}`);
+    }
+
+    // ✅ Vérification commande identique dans les 10 minutes
     const lastOrder = await Order.findOne({
       agent_id: req.auth.userId,
       type: service.type,
@@ -566,6 +574,7 @@ exports.launchOrder = async (req, res) => {
       }
     }
 
+    // 🆕 Création de la nouvelle commande
     const newOrder = new Order({
       amount: parseInt(amount),
       phone: service.phone,
@@ -587,6 +596,7 @@ exports.launchOrder = async (req, res) => {
     return res.status(500).json({ status: 1, message: "Erreur serveur" });
   }
 };
+
 
 
 exports.minutesTest = (req, res) => {
@@ -3191,7 +3201,7 @@ exports.manageReturns2 = async (req, res) => {
     const orders = await Order.find({
       agent_id: user._id,
       status: { $in: ["initial", "partial"] },
-      type: { $in: Object.keys(shortTypes) },
+      type: { $in: ["am", "mm"] },
     }).sort({ date: -1 });
 
     const initials = orders.filter(o => o.status === "initial");
