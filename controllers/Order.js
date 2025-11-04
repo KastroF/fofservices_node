@@ -546,7 +546,7 @@ exports.launchOrder = async (req, res) => {
     }
 
     // 🧹 NOUVELLE CONDITION : supprimer l’ancienne commande "initial" du même type
-    const deleted = await Order.deleteMany({
+   /* const deleted = await Order.deleteMany({
       agent_id: req.auth.userId,
       type: service.type,
       status: "initial"
@@ -555,7 +555,7 @@ exports.launchOrder = async (req, res) => {
     if (deleted.deletedCount > 0) {
       console.log(`🧹 ${deleted.deletedCount} commande(s) initial supprimée(s) pour ${service.type}`);
     }
-
+*/
     // ✅ Vérification commande identique dans les 10 minutes
     const lastOrder = await Order.findOne({
       agent_id: req.auth.userId,
