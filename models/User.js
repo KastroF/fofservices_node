@@ -30,6 +30,7 @@ const userSchema = mongoose.Schema({
     minAmountMm: {type: Number}, 
     minAmountF: {type: Number}, 
     minAmountE: {type: Number}, 
+    maxFlash: {type: Number}, 
     amBalance: {type: Number},
     mmBalance: {type: Number},
     flashBalance: {type: Number},

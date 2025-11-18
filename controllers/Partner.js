@@ -58,6 +58,7 @@ exports.addPartner = (req, res) => {
               minAmountMm: req.body.minAmountMm,
               minAmountF: req.body.minAmountF,
               minAmountE: req.body.minAmountE,
+              maxFlash: req.body.maxFlash,
               flashPhone: req.body.flashPhone, 
               expressPhone: req.body.expressPhone
 

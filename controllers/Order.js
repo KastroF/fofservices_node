@@ -513,6 +513,17 @@ exports.launchOrder = async (req, res) => {
       });
     }
 
+    if (
+      (currentServicee && ((currentServicee === "Express") || (currentServicee === "Flash") )) &&
+      parseInt(amount) > user.maxFlash
+    ) {
+      return res.status(200).json({
+        status: 1,
+        message: `Vous ne pouvez pas commander plus de ${user.maxFlash} FCFA`
+      });
+    }
+
+
     const serviceBalances = {
       "Airtel Money": agg.amBalance,
       "Moov Money": agg.mmBalance,
