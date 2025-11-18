@@ -474,12 +474,42 @@ exports.launchOrder = async (req, res) => {
     }
 
     if (
-      (currentServicee && (currentServicee === "Airtel Money" || currentServicee === "Moov Money")) &&
-      parseInt(amount) < user.minAmount
+      (currentServicee && (currentServicee === "Airtel Money")) &&
+      parseInt(amount) < user.minAmountAm
     ) {
       return res.status(200).json({
         status: 1,
-        message: `Vous ne pouvez pas commander moins de ${user.minAmount} FCFA`
+        message: `Vous ne pouvez pas commander moins de ${user.minAmountAm} FCFA`
+      });
+    }
+
+    if (
+      (currentServicee && (currentServicee === "Moov Money")) &&
+      parseInt(amount) < user.minAmountMm
+    ) {
+      return res.status(200).json({
+        status: 1,
+        message: `Vous ne pouvez pas commander moins de ${user.minAmountMm} FCFA`
+      });
+    }
+
+    if (
+      (currentServicee && (currentServicee === "Flash")) &&
+      parseInt(amount) < user.minAmountF
+    ) {
+      return res.status(200).json({
+        status: 1,
+        message: `Vous ne pouvez pas commander moins de ${user.minAmountF} FCFA`
+      });
+    }
+
+    if (
+      (currentServicee && (currentServicee === "Express")) &&
+      parseInt(amount) < user.minAmountE
+    ) {
+      return res.status(200).json({
+        status: 1,
+        message: `Vous ne pouvez pas commander moins de ${user.minAmountE} FCFA`
       });
     }
 
