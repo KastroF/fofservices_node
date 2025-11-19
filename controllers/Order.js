@@ -494,7 +494,7 @@ exports.launchOrder = async (req, res) => {
     }
 
     if (
-      (currentServicee && (currentServicee === "Flash")) &&
+      (currentServicee && (currentServicee === "Flash Airtel")) &&
       parseInt(amount) < user.minAmountF
     ) {
       return res.status(200).json({
@@ -514,7 +514,7 @@ exports.launchOrder = async (req, res) => {
     }
 
     if (
-      (currentServicee && ((currentServicee === "Express") || (currentServicee === "Flash") )) &&
+      (currentServicee && ((currentServicee === "Express") || (currentServicee === "Flash Airtel") )) &&
       parseInt(amount) > user.maxFlash
     ) {
       return res.status(200).json({
