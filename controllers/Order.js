@@ -5,6 +5,36 @@ const Deletedorder = require("../models/Deletedorderr");
 const Cash = require("../models/Cash")
 const mongoose = require('mongoose');
 const ObjectId = mongoose.Types.ObjectId;
+const { notifyOrder, notifyOrders, notifyBalances } = require("../realtime");
+
+// Une commande "sending" a été réservée par le téléphone de l'agrégateur : l'USSD est (ou a été) lancé.
+// On ne la redonne jamais à la boucle d'envoi, sinon l'agent peut recevoir le montant deux fois.
+const ORDER_EXPIRATION_MINUTES = 10;
+
+const BALANCE_FIELDS = { am: "amBalance", mm: "mmBalance", flash: "flashBalance", express: "expressBalance" };
+const SERVICE_TYPES = { "Airtel Money": "am", "Moov Money": "mm", "Flash Airtel": "flash", "Express": "express" };
+
+// Ce que l'envoi retire réellement du stock de l'agrégateur : Flash et Express ajoutent la commission (mêmes taux que les codes USSD).
+const stockCost = (type, amount) => {
+  const value = parseInt(amount) || 0;
+  if (type === "flash") return value * 1.05;
+  if (type === "express") return value * 1.055;
+  return value;
+};
+
+// Montant déjà engagé sur le stock de l'agrégateur par des commandes pas encore confirmées.
+const reservedStock = async (aggId, type, statuses, excludeId) => {
+  const filter = { agg_id: aggId, type, status: { $in: statuses } };
+  if (excludeId) filter._id = { $ne: excludeId };
+  const orders = await Order.find(filter, { amount: 1, type: 1 });
+  return orders.reduce((sum, o) => sum + stockCost(o.type, o.amount), 0);
+};
+
+const availableStock = async (agg, type, statuses, excludeId) => {
+  const balance = agg ? agg[BALANCE_FIELDS[type]] : undefined;
+  if (typeof balance !== "number") return null;
+  return balance - await reservedStock(agg._id.toString(), type, statuses, excludeId);
+};
 
 
 exports.getPendingReturns = async (req, res) => {
@@ -332,22 +362,39 @@ exports.addAgentOrder = async (req, res) => {
           
 }
 
+// Fenêtre pendant laquelle un envoi identique (même agent, service, montant) est traité comme un double appui.
+const ADD_ORDER_DUPLICATE_MS = 60 * 1000;
+
 exports.addOrder = async (req, res) => {
   
-
-  console.log("le code ", req.body);
     
-   const user = await User.findOne({_id: req.body._id})
- /*
-    if((req.auth.userId === user.agg_id) && !itsme) {
+    const user = await User.findOne({_id: req.body._id})
 
-      return res.status(200).json({
-        status: 1,
-        message: `Vous n'êtes pas autorisé à utilisé cette application`
-      });
-      
+    if(!user){
+
+        return res.status(200).json({status: 1, message: "Agent introuvable"});
     }
-  */
+
+    const amount = parseInt(req.body.amount);
+
+    if(!amount || amount <= 0){
+
+        return res.status(200).json({status: 1, message: "Montant invalide"});
+    }
+
+    const recent = await Order.findOne({
+      agent_id: req.body._id,
+      type: req.body.type,
+      amount,
+      status: {$in: ["order", "sending", "initial"]},
+      date: {$gte: new Date(Date.now() - ADD_ORDER_DUPLICATE_MS)}
+    });
+
+    if(recent){
+
+        return res.status(200).json({status: 1, message: `Un envoi de ${amount.toLocaleString("fr-FR")} Fcfa vient déjà d'être enregistré pour cet agent`});
+    }
+  
     const order = new Order({
       
       amount: parseInt(req.body.amount),
@@ -365,7 +412,8 @@ exports.addOrder = async (req, res) => {
   
   
     order.save().then(() => {
-     
+
+      notifyOrder(order);
       res.status(201).json({status: 0});
         
     }, (err) => {
@@ -425,16 +473,32 @@ console.log("on teste l'envoi", req.body);
   
   
   
-    Order.findOne({amount, read: false, type: req.body.type, phone: req.body.phone}).sort({date: -1}).limit(1).then((order) => {
-      
+  // Numéro ou montant illisible dans le SMS : { phone: undefined } est retiré par mongoose et la recherche
+  // confirmerait la dernière commande de ce montant, quel que soit l'agent.
+  if(typeof req.body.phone !== "string" || !/^\d{9}$/.test(req.body.phone) || !amount){
+
+      return res.status(200).json({status: 1, message: "Numéro ou montant illisible dans le SMS"});
+  }
+
+    // Un retour non lu (read: false) n'est pas un envoi : il ne doit pas être confirmé ici.
+    Order.findOne({amount, read: false, type: req.body.type, phone: req.body.phone, status: {$ne: "return"}}).sort({date: -1}).limit(1).then((order) => {
+
       console.log("je vois", order);
-      
+
       if(order){
-        
-        
-          
-        Order.updateOne({_id: order._id}, {$set: {read: true}}).then(() => {
-          
+
+        // Le SMS opérateur prouve que l'envoi a eu lieu : une commande restée "sending"
+        // (confirmation updateorderr perdue) devient bien une dette de l'agent.
+        const update = {read: true};
+
+        if(order.status === "sending" || order.status === "failed"){
+
+            update.status = "initial";
+        }
+
+        Order.updateOne({_id: order._id}, {$set: update}).then(() => {
+
+          notifyOrder({...order.toObject(), ...update});
           res.status(200).json({status: 0});
             
         }, (err) => {
@@ -524,16 +588,11 @@ exports.launchOrder = async (req, res) => {
     }
 
 
-    const serviceBalances = {
-      "Airtel Money": agg.amBalance,
-      "Moov Money": agg.mmBalance,
-      "Flash Airtel": agg.flashBalance
-    };
+    // Solde réellement disponible = solde connu - commandes en attente d'envoi ou en cours d'envoi.
+    const orderType = SERVICE_TYPES[currentServicee];
+    const available = orderType ? await availableStock(agg, orderType, ["order", "sending"]) : null;
 
-    if (
-      serviceBalances[currentServicee] !== undefined &&
-      serviceBalances[currentServicee] < amount
-    ) {
+    if (available !== null && stockCost(orderType, amount) > available) {
       return res.status(200).json({
         status: 1,
         message: "Le solde de votre agrégateur est insuffisant, contactez-le"
@@ -544,7 +603,7 @@ exports.launchOrder = async (req, res) => {
       {
         $match: {
           agent_id: req.auth.userId,
-          status: { $in: ["partial", "initial"] }
+          status: { $in: ["partial", "initial", "order", "sending"] }
         }
       },
       {
@@ -552,7 +611,7 @@ exports.launchOrder = async (req, res) => {
           _id: null,
           totalAmount: {
             $sum: {
-              $cond: [{ $eq: ["$status", "initial"] }, "$amount", 0]
+              $cond: [{ $in: ["$status", ["initial", "order", "sending"]] }, "$amount", 0]
             }
           },
           totalRest: {
@@ -586,21 +645,20 @@ exports.launchOrder = async (req, res) => {
       return res.status(400).json({ status: 1, message: "Service non reconnu" });
     }
 
-    // 🧹 NOUVELLE CONDITION : supprimer l’ancienne commande "initial" du même type
-   const deleted = await Order.deleteMany({
+    // Une nouvelle commande remplace celle du même type encore en attente d'envoi (jamais celle en cours d'envoi).
+    const deleted = await Order.deleteMany({
       agent_id: req.auth.userId,
       type: service.type,
       status: "order"
     });
 
-    
-
     if (deleted.deletedCount > 0) {
-      console.log(`🧹 ${deleted.deletedCount} commande(s) initial supprimée(s) pour ${service.type}`);
+      console.log(`${deleted.deletedCount} commande(s) en attente remplacée(s) pour ${service.type}`);
     }
-    // ✅ Vérification commande identique dans les 10 minutes
+
     const lastOrder = await Order.findOne({
       agent_id: req.auth.userId,
+      status: { $ne: "failed" },
       type: service.type,
       phone: service.phone,
       amount: parseInt(amount),
@@ -616,7 +674,6 @@ exports.launchOrder = async (req, res) => {
       }
     }
 
-    // 🆕 Création de la nouvelle commande
     const newOrder = new Order({
       amount: parseInt(amount),
       phone: service.phone,
@@ -631,6 +688,7 @@ exports.launchOrder = async (req, res) => {
     });
 
     await newOrder.save();
+    notifyOrder(newOrder);
     return res.status(201).json({ status: 0 });
 
   } catch (err) {
@@ -638,7 +696,6 @@ exports.launchOrder = async (req, res) => {
     return res.status(500).json({ status: 1, message: "Erreur serveur" });
   }
 };
-
 
 
 exports.minutesTest = (req, res) => {
@@ -926,6 +983,15 @@ exports.getOrders = async (req, res) => {
       }
     ])
     
+    // Montant exact que "recoveryall" va recouvrer (AM et Moov uniquement), renvoyé tel quel lors de la validation.
+    let recoverable = null;
+
+    if(req.body._id){
+
+      const recoverableOrders = await Order.find({agent_id: req.body._id, status: {$in: ["initial", "partial"]}, type: {$in: ["am", "mm"]}});
+      recoverable = recoverableOrders.reduce((sum, order) => sum + (order.status === "initial" ? order.amount : order.rest), 0);
+    }
+
     let totals3 = [];
     
     if(req.body._id){
@@ -1129,7 +1195,7 @@ exports.getOrders = async (req, res) => {
 
 
     res.status(200).json({status: 0, orders: resultat, startAt: resultat.length === 10 ? parseInt(req.body.startAt) + 
-                             10 : null, amount: totalAmount + totalRest, amount2:  totalAmount2 + totalRest2, amount3: totalReturn1 +  totalReturn2, final}); 
+                             10 : null, amount: totalAmount + totalRest, amount2:  totalAmount2 + totalRest2, amount3: totalReturn1 +  totalReturn2, recoverable, final}); 
     
     
 }catch(e){
@@ -1142,9 +1208,6 @@ exports.getOrders = async (req, res) => {
 
 exports.recoveryAll = async (req, res) => {
   
-    //const 
-  
-  
   try{
 
     const userrr = await User.findOne({_id: req.auth.userId})
@@ -1153,7 +1216,15 @@ exports.recoveryAll = async (req, res) => {
     
     const orders = await Order.find({$and: [{$or: [{status: "initial"}, {status: "partial"}]}, {$or: [{type: "am"}, {type: "mm"}]}, 
                                            {agent_id: req.body._id}] }); 
-    
+
+    const total = orders.reduce((sum, order) => sum + (order.status === "initial" ? order.amount : order.rest), 0);
+
+    // Le recouvreur valide le montant qu'il a vu à l'écran. Si l'agent a commandé (ou remboursé)
+    // entre-temps, on refuse au lieu de recouvrer une somme qu'il n'a pas réellement encaissée.
+    if(req.body.expectedTotal !== undefined && parseInt(req.body.expectedTotal) !== total){
+
+        return res.status(200).json({status: 2, total, message: `La dette a changé : elle est maintenant de ${total.toLocaleString("fr-FR")} Fcfa. Vérifiez le montant avant de valider.`});
+    }
 
     for(let order of orders){
       
@@ -1164,6 +1235,7 @@ exports.recoveryAll = async (req, res) => {
         date: new Date()
     }
     
+        const previousStatus = order.status;
       
         if(order.recoveries){
           
@@ -1182,12 +1254,12 @@ exports.recoveryAll = async (req, res) => {
       
          order.status = 'recovery'
       
-      
-        await Order.updateOne({_id: order._id}, {$set: order} ); 
+        // Mise à jour conditionnelle : si un retour a modifié la commande entre-temps, on ne l'écrase pas.
+        await Order.updateOne({_id: order._id, status: previousStatus}, {$set: order} ); 
       
     }
     
-    
+    notifyOrders(orders);
     res.status(201).json({status: 0});
     
   }else{
@@ -1204,202 +1276,201 @@ exports.recoveryAll = async (req, res) => {
     
 }
 
-exports.toRecovery = (req, res) => {
-  
-    Order.findOne({_id: req.body._id}).then((order) => {
-      
-      if(order.status == "initial"){
-        
-          if(order.amount == req.body.amount){
-            
-            order.status = "recovery"; 
-            
-              
-          }else{
-            
-            order.status = "partial"; 
-            order.rest = parseInt(order.amount) - parseInt(req.body.amount);
-            
-          }
-      
-      }else{
-        
-        if(order.rest == req.body.amount){
-          
-            order.status = "recovery"; 
-            order.rest = 0; 
-          
-        }else{
-          
-            order.rest = parseInt(order.rest) - parseInt(req.body.amount)
-        }
-          
-      }
-      
-      const recovery = {
-      
-        author_id: req.auth.userId, 
-        amount: req.body.amount, 
-        date: new Date()
-    
-      }
-      
-      if(order.recoveries){
-        
-          order.recoveries.push(recovery);
-      
-      }else{
-        
-          order.recoveries = [recovery]
-      }
-      
-      Order.updateOne({_id: order._id}, {$set: order}).then(() => {
-        
-        res.status(201).json({status: 0});
-          
-      }, (err) => {
-      
-        console.log(err); 
-        res.status(505).json({err})
-    })
-      
-      
-        
-    }, (err) => {
-      
-        console.log(err); 
-        res.status(505).json({err})
-    })
+// Fenêtre pendant laquelle un recouvrement identique (même commande, même montant, même auteur) est un double appui.
+const RECOVERY_DUPLICATE_MS = 60 * 1000;
+
+exports.toRecovery = async (req, res) => {
+
+  try {
+
+    const amount = parseInt(req.body.amount);
+
+    if(!amount || amount <= 0){
+
+        return res.status(200).json({status: 1, message: "Montant invalide"});
+    }
+
+    const order = await Order.findOne({_id: req.body._id});
+
+    if(!order || (order.status !== "initial" && order.status !== "partial")){
+
+        return res.status(200).json({status: 1, message: "Cette commande n'est plus à recouvrer, veuillez actualiser"});
+    }
+
+    const remaining = order.status === "initial" ? parseInt(order.amount) : parseInt(order.rest);
+
+    if(amount > remaining){
+
+        return res.status(200).json({status: 1, message: `Le montant est supérieur au reste de ${remaining.toLocaleString("fr-FR")} Fcfa`});
+    }
+
+    const recentDuplicate = (order.recoveries || []).find(item =>
+        item && item.author_id === req.auth.userId &&
+        parseInt(item.amount) === amount &&
+        !item.return &&
+        Date.now() - new Date(item.date).getTime() < RECOVERY_DUPLICATE_MS
+    );
+
+    if(recentDuplicate){
+
+        return res.status(200).json({status: 1, message: `Ce recouvrement de ${amount.toLocaleString("fr-FR")} Fcfa vient déjà d'être enregistré`});
+    }
+
+    const rest = remaining - amount;
+    const update = rest === 0 ? {status: "recovery", rest: 0} : {status: "partial", rest};
+    const recovery = {author_id: req.auth.userId, amount, date: new Date()};
+
+    // Mise à jour conditionnelle : si un autre recouvrement (ou un retour) est passé entre-temps, rien n'est écrit.
+    const updated = await Order.findOneAndUpdate(
+      {
+        _id: order._id,
+        status: order.status,
+        rest: order.rest === undefined || order.rest === null ? null : order.rest
+      },
+      {$set: update, $push: {recoveries: recovery}},
+      {new: true}
+    );
+
+    if(!updated){
+
+        return res.status(200).json({status: 1, message: "Cette commande vient d'être modifiée, veuillez actualiser"});
+    }
+
+    notifyOrder(updated);
+    res.status(201).json({status: 0});
+
+  } catch(err) {
+
+      console.log(err); 
+      res.status(505).json({err})
+  }
 }
 
-exports.getPendingOrders = (req, res) => {
-  
-    Order.find({agg_id: req.auth.userId, status: "order"}).sort({date: -1}).limit(2).then(async (orders) => {
-      
-     // console.log(order); 
-      
-        if(orders[0]){
-          
-          let diffInMinutes = 0;
-          let diffInMinutes2 = 0;
-          let diffInMilliseconds
-          
-      
-            const date1 = new Date(orders[0].date); 
-            const date2 = new Date(); 
-          
-            diffInMilliseconds = Math.abs(date2 - date1);
-            diffInMinutes = diffInMilliseconds / (1000 * 60);
-            
-            
-            if(orders[1]){
-              
-                          
-                const date3 = new Date(orders[1].date); 
-                let diffInMilliseconds2 = Math.abs(date1 - date3) ; 
-                diffInMinutes2 = diffInMilliseconds2 / (1000 * 60);
-              
-            }
-          
-          
-      if(orders[1]){
-            
-        if((diffInMinutes2 < 10) && (orders[0].amount == orders[1].amount && orders[0].type == orders[1].type && orders[0].agent_id == orders[1].agent_id)){
-            
-            await Order.deleteOne({_id: orders[1]._id});
-            res.status(201).json({status: 0})
-          
-          }else{
-            
-         if(diffInMinutes >= 10){
-            
-            await Order.deleteOne({_id: orders[0]._id});
-            res.status(201).json({status: 0})
-          
-          }else{
-            
-            /*  if(orders[0].amount == orders[1].amount && orders[0].type == orders[1].type && orders[0].agent_id == orders[1].agent_id
-                && 1){
-                
-                  
-              }else{
-                
-                
-              } */
-            
-              console.log("C'est trop bien ");
-              res.status(201).json({status: 0, order: orders[0]});
-              
-          }
-              
-          }
-            
-            
-          }else{
-            
-          if(diffInMinutes >= 10){
-            
-            await Order.deleteOne({_id: orders[0]._id});
-            res.status(201).json({status: 0})
-          
-          }else{
-            
-            /*  if(orders[0].amount == orders[1].amount && orders[0].type == orders[1].type && orders[0].agent_id == orders[1].agent_id
-                && 1){
-                
-                  
-              }else{
-                
-                
-              } */
-            
-              console.log("C'est trop bien ");
-              res.status(201).json({status: 0, order: orders[0]});
-              
-          }
-            
-              
-          }
-   
-          
-          
-          
+// Marque une commande comme non envoyée : elle reste visible (orange, supprimable) mais n'est jamais comptée.
+const markNotSent = async (order, reason) => {
+  const updated = await Order.findOneAndUpdate(
+    {_id: order._id, status: "order"},
+    {$set: {status: "failed", ussdResponse: reason}},
+    {new: true}
+  );
+  notifyOrder(updated);
+  return updated;
+};
 
-        // Convertissez la différence en minutes
-         
-          
-        
+exports.getPendingOrders = async (req, res) => {
 
-      
-          
-        }else{
-          
-            res.status(200).json({status: 0});
-        }
-      
+  try {
 
-          
-        
-        
-    }, (err) => {
-      
-        console.log(err); 
-        res.status(505).json({err})
-    })
-  
+    const aggId = req.auth.userId;
+    const expirationLimit = new Date(Date.now() - ORDER_EXPIRATION_MINUTES * 60 * 1000);
+
+    // 1. Commandes trop anciennes (téléphone d'envoi éteint, app fermée...) : jamais envoyées en rafale plus tard.
+    const staleOrders = await Order.find({agg_id: aggId, status: "order", date: {$lt: expirationLimit}});
+
+    for(const stale of staleOrders){
+        await markNotSent(stale, `Expirée : non envoyée dans les ${ORDER_EXPIRATION_MINUTES} minutes`);
+    }
+
+    // 2. La plus ancienne commande en attente d'abord (ordre d'arrivée).
+    const candidate = await Order.findOne({agg_id: aggId, status: "order"}).sort({date: 1});
+
+    if(!candidate){
+
+        return res.status(200).json({status: 0});
+    }
+
+    // 3. Même agent, même service, même montant déjà envoyé (ou en cours) à moins de 10 minutes : doublon.
+    const windowMs = ORDER_EXPIRATION_MINUTES * 60 * 1000;
+    const duplicate = await Order.findOne({
+      _id: {$ne: candidate._id},
+      agent_id: candidate.agent_id,
+      type: candidate.type,
+      amount: candidate.amount,
+      status: {$in: ["sending", "initial", "partial", "recovery"]},
+      date: {$gte: new Date(new Date(candidate.date).getTime() - windowMs), $lte: new Date(new Date(candidate.date).getTime() + windowMs)}
+    });
+
+    if(duplicate){
+
+        await markNotSent(candidate, "Doublon : le même montant a déjà été envoyé à cet agent il y a moins de 10 minutes");
+        return res.status(201).json({status: 0});
+    }
+
+    // 4. Solde de l'agrégateur, moins les envois déjà en cours : on ne lance pas un USSD voué à l'échec.
+    const agg = await User.findById(aggId);
+    const available = await availableStock(agg, candidate.type, ["sending"], candidate._id);
+
+    if(available !== null && stockCost(candidate.type, candidate.amount) > available){
+
+        await markNotSent(candidate, `Solde insuffisant : ${Math.max(0, Math.floor(available)).toLocaleString("fr-FR")} F disponibles`);
+        return res.status(201).json({status: 0});
+    }
+
+    // 5. Réservation atomique : seul l'appel qui fait passer la commande de "order" à "sending"
+    // la reçoit. Un second tick (ou une seconde boucle) qui arrive en même temps reçoit null.
+    const order = await Order.findOneAndUpdate(
+      {_id: candidate._id, status: "order"},
+      {$set: {status: "sending", sendingAt: new Date()}},
+      {new: true}
+    );
+
+    if(!order){
+
+        return res.status(201).json({status: 0});
+    }
+
+    notifyOrder(order);
+    res.status(201).json({status: 0, order});
+
+  }catch(err){
+
+      console.log(err); 
+      res.status(505).json({err})
+  }
 }
 
-exports.updateOrderr = (req, res) => {
-  
-    Order.updateOne({_id: req.body._id}, {$set: {status: "initial"}}).then(() => {
-      
-        res.status(200).json({status: 0})
-    
-    }, (err) => {
-      
-        console.log(err); 
-        res.status(505).json({err})
-    })
+exports.updateOrderr = async (req, res) => {
+
+  try {
+
+    let order;
+
+    if(req.body.failed){
+
+        // Non composé (pas de SIM, permission...) : la commande peut repartir dans la boucle d'envoi.
+        // Composé mais refusé par l'opérateur ("dialed") : "failed", jamais renvoyée automatiquement.
+        order = await Order.findOneAndUpdate(
+          {_id: req.body._id, status: "sending"},
+          {$set: {status: req.body.dialed ? "failed" : "order", ussdResponse: req.body.ussdResponse}},
+          {new: true}
+        );
+
+    }else{
+
+        order = await Order.findOneAndUpdate(
+          {_id: req.body._id, status: {$in: ["sending", "order"]}},
+          {$set: {status: "initial", ussdResponse: req.body.ussdResponse}},
+          {new: true}
+        );
+
+        // L'opérateur a accepté : on retire tout de suite le montant du stock de l'agrégateur,
+        // sans attendre le SMS de solde, pour que les commandes suivantes voient un solde juste.
+        if(order && order.agg_id && BALANCE_FIELDS[order.type]){
+
+            const field = BALANCE_FIELDS[order.type];
+            await User.updateOne({_id: order.agg_id, [field]: {$type: "number"}}, {$inc: {[field]: -Math.round(stockCost(order.type, order.amount))}});
+            notifyBalances(order.agg_id).catch(err => console.log(err));
+        }
+    }
+
+    notifyOrder(order);
+    res.status(200).json({status: 0})
+
+  }catch(err){
+
+      console.log(err); 
+      res.status(505).json({err})
+  }
 }
 
 
@@ -1451,6 +1522,7 @@ exports.getReports = async (req, res) => {
   
     let pipeline; 
     let pipeline2;
+    let pipeline4;
   
   try{
     
@@ -1505,6 +1577,74 @@ exports.getReports = async (req, res) => {
         }
       },
   ];
+
+  pipeline4 = [
+    {
+      $match: {
+        $and: [
+          { 'recoveries.date': { $gte: start, $lte: end } },
+          { type },
+          {read: true},
+          { status: { $in: ['partial', 'recovery'] } },
+          { 'recoveries.author_id': req.body._id },
+        ],
+      },
+    },
+    {
+      $unwind: '$recoveries', // Décompose le tableau recoveries
+    },
+    {
+      $match: {
+        'recoveries.author_id': req.body._id,
+        'recoveries.date': { $gte: start, $lte: end },
+      },
+    },
+    {
+      $addFields: {
+        'recoveries.amountNumber': {
+          $cond: {
+            if: { $isNumber: '$recoveries.amount' },
+            then: '$recoveries.amount',
+            else: {
+              $convert: {
+                input: '$recoveries.amount',
+                to: 'double',
+                onError: 0,
+                onNull: 0,
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        totalWithReturn: {
+          $sum: {
+            $cond: [
+              { $eq: ['$recoveries.return', true] },
+              '$recoveries.amountNumber',
+              0,
+            ],
+          },
+        },
+        totalWithoutReturn: {
+          $sum: {
+            $cond: [
+              { $or: [
+                { $eq: ['$recoveries.return', false] },
+                { $not: ['$recoveries.return'] } // Cas où le champ n'existe pas
+              ]},
+              '$recoveries.amountNumber',
+              0,
+            ],
+          },
+        },
+      },
+    },
+  ];
+  
     
      pipeline2 = [
           {
@@ -1654,6 +1794,73 @@ exports.getReports = async (req, res) => {
         },
     },
     ]
+
+    pipeline4 = [
+      {
+        $match: {
+          $and: [
+            { 'recoveries.date': { $gte: start, $lte: end } },
+            { type },
+            { status: { $in: ['partial', 'recovery'] } },
+            { 'recoveries.author_id': req.body._id },
+          ],
+        },
+      },
+      {
+        $unwind: '$recoveries', // Décompose le tableau recoveries
+      },
+      {
+        $match: {
+          'recoveries.author_id': req.body._id,
+          'recoveries.date': { $gte: start, $lte: end },
+        },
+      },
+      {
+        $addFields: {
+          'recoveries.amountNumber': {
+            $cond: {
+              if: { $isNumber: '$recoveries.amount' },
+              then: '$recoveries.amount',
+              else: {
+                $convert: {
+                  input: '$recoveries.amount',
+                  to: 'double',
+                  onError: 0,
+                  onNull: 0,
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalWithReturn: {
+            $sum: {
+              $cond: [
+                { $eq: ['$recoveries.return', true] },
+                '$recoveries.amountNumber',
+                0,
+              ],
+            },
+          },
+          totalWithoutReturn: {
+            $sum: {
+              $cond: [
+                { $or: [
+                  { $eq: ['$recoveries.return', false] },
+                  { $not: ['$recoveries.return'] } // Cas où le champ n'existe pas
+                ]},
+                '$recoveries.amountNumber',
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ];
+    
       
         
     }
@@ -1686,13 +1893,15 @@ exports.getReports = async (req, res) => {
     const result = await Order.aggregate(pipeline);
     
     const result2 = await Order.aggregate(pipeline2);
+    const result4 = await Order.aggregate(pipeline4);
     
     console.log(result2);
    // console.log(result[0].recoveries);
     
      
     res.status(200).json({orders: result, status: 0, startAt: result.length === 10 ? parseInt(req.body.startAt) + 10 : null, 
-                         amount: result2.length > 0 ? result2[0].totalAmount: 0, cash: cashh});
+                         amount: result2.length > 0 ? result2[0].totalAmount: 0, cash: cashh, 
+                         amount1: result4.length > 0 ? result4[0].totalWithoutReturn: 0 , amount2 : result4.length > 0 ? result4[0].totalWithReturn: 0 });
     
     
   }catch(e){
@@ -1726,7 +1935,8 @@ exports.deleteOrder = (req, res) => {
       deletedOrder.save().then(async () => {
         
         await Order.deleteOne({_id: order._id});
-        
+        notifyOrder(order);
+
         res.status(200).json({status: 0});
           
       }, (err) => {
@@ -3180,12 +3390,20 @@ exports.manageReturns2 = async (req, res) => {
     const short = { [phoneKey]: phone, agg_id: userId };
     const balance = { [balanceKey]: newBalance };
 
+    // Sans référence, findOne({ trans_id: undefined }) renverrait n'importe quelle commande.
+    if (!trans_id) {
+      return res.status(200).json({ status: 1, message: "Référence de transaction absente du SMS" });
+    }
+
     const existingOrder = await Order.findOne({ trans_id });
     if (existingOrder) {
       return res.status(200).json({ status: 0, message: "Retour déjà enregistré" });
     }
 
-    const user = await User.findOne(short);
+    // Numéro illisible dans le SMS : on ne cherche pas d'agent, sinon { amPhone: null } (ou undefined, retiré par
+    // mongoose) renverrait le premier agent sans numéro ou le premier agent de l'agrégateur, qui recevrait le retour.
+    const validPhone = typeof phone === "string" && /^\d{9}$/.test(phone);
+    const user = validPhone && phoneKey ? await User.findOne(short) : null;
 
     const recoveryObj = amt => ({
       author_id: user?.agg_id,
@@ -3208,7 +3426,7 @@ exports.manageReturns2 = async (req, res) => {
     };
 
     const saveReturnOrder = async (usedOrders = [], message = "", rest = 0) => {
-      await Order.create({
+      const returnOrder = await Order.create({
         amount: parsedAmount,
         phone,
         rec_id: user?.rec_id ?? null,
@@ -3222,6 +3440,7 @@ exports.manageReturns2 = async (req, res) => {
         rest,
         message,
       });
+      notifyOrder(returnOrder);
     };
 
     if (!user) {
@@ -3243,7 +3462,7 @@ exports.manageReturns2 = async (req, res) => {
     const orders = await Order.find({
       agent_id: user._id,
       status: { $in: ["initial", "partial"] },
-      type: { $in: ["am", "mm"] },
+      type: { $in: Object.keys(shortTypes) },
     }).sort({ date: -1 });
 
     const initials = orders.filter(o => o.status === "initial");
@@ -3325,6 +3544,7 @@ exports.manageReturns2 = async (req, res) => {
         try {
           await saveReturnOrder(list, formatMessage(list, handler.label), rest);
           await updateOrders(list, handler.updater);
+          notifyOrders(list);
           return res.status(201).json({ status: 0 });
         } catch (err) {
           if (err.code === 11000) {
