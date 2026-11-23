@@ -20,7 +20,6 @@ const userSchema = mongoose.Schema({
     date: {type: Date}, 
     status: {type: String}, 
     agg_id: {type: String}, 
-    parent_id: {type: String}, 
     rec_id: {type: String}, 
     recouvreurs: {type: Number}, 
     pos: {type: Number}, 

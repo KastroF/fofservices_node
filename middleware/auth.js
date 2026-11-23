@@ -1,10 +1,6 @@
 const jwt = require("jsonwebtoken"); 
 const User = require("../models/User"); 
 
-const JWT_SECRET = "JxqKuulLNPCNfytiyqtsygygfRJYTjnju8u9yup8y89pjgkbhilaebAqetflqRfhhouhpb";
-
-const verifyToken = (token) => jwt.verify(token, JWT_SECRET);
-
 
 module.exports = (req, res, next) => {
   
@@ -17,14 +13,12 @@ module.exports = (req, res, next) => {
 
             const token = req.headers.authorization.split(' ')[1];
             
-            const decodedToken = verifyToken(token); 
+            const decodedToken = jwt.verify(token, "JxqKuulLNPCNfytiyqtsygygfRJYTjnju8u9yup8y89pjgkbhilaebAqetflqRfhhouhpb"); 
 
             const userId = decodedToken.userId; 
             
-            // ownerId : compte agrégateur principal qui a ouvert ce sous-compte (absent pour un jeton classique).
             req.auth = {
-                userId: userId,
-                ownerId: decodedToken.ownerId || userId
+                userId: userId
             }
           
           
@@ -95,6 +89,3 @@ module.exports = (req, res, next) => {
                 res.status(401).json({error})
         }
 }
-
-module.exports.verifyToken = verifyToken;
-module.exports.JWT_SECRET = JWT_SECRET;

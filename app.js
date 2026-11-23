@@ -62,7 +62,6 @@ const orderRouter = require("./routes/Order");
 const partnerRouter = require("./routes/Partner")
 const serviceRouter = require("./routes/Service");
 const cashRouter = require("./routes/Cash");
-const smsRouter = require("./routes/Sms");
 
 
 app.use("/api/user", userRouter);
@@ -70,6 +69,5 @@ app.use("/api/order", orderRouter);
 app.use("/api/partner", partnerRouter)
 app.use("/api/service", serviceRouter);
 app.use("/api/cash", cashRouter);
-app.use("/api/sms", smsRouter);
 
 module.exports = app;
